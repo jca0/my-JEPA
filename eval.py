@@ -1,4 +1,5 @@
 import os
+import re
 
 os.environ["MUJOCO_GL"] = "egl"
 
@@ -37,12 +38,45 @@ def get_episodes_length(dataset, episodes):
     return np.array(lengths)
 
 
+ROOT = Path(__file__).resolve().parent
+
+
+def load_model(name, cache_dir):
+    from hydra.utils import instantiate
+    import json
+
+    ckpt_dir = Path(cache_dir) / "checkpoints"
+    pt_path = ckpt_dir / name
+    config_path = pt_path.parent / "config.json"
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    state_dict = torch.load(pt_path, map_location="cpu")
+
+    if any("encoder.encoder.layer." in k for k in state_dict):
+        remapped = {}
+        for key, value in state_dict.items():
+            new_key = re.sub(r"encoder\.encoder\.layer\.(\d+)", r"encoder.layers.\1", key)
+            new_key = new_key.replace("attention.attention.query", "attention.q_proj")
+            new_key = new_key.replace("attention.attention.key", "attention.k_proj")
+            new_key = new_key.replace("attention.attention.value", "attention.v_proj")
+            new_key = new_key.replace("attention.output.dense", "attention.o_proj")
+            new_key = new_key.replace("intermediate.dense", "mlp.fc1")
+            new_key = new_key.replace("output.dense", "mlp.fc2")
+            remapped[new_key] = value
+        state_dict = remapped
+
+    model = instantiate(config)
+    model.load_state_dict(state_dict)
+    return model
+
+
 def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
     dataset = swm.data.HDF5Dataset(
         dataset_name,
         keys_to_cache=cfg.dataset.keys_to_cache,
-        cache_dir=dataset_path,
+        cache_dir=ROOT,
     )
     return dataset
 
@@ -85,7 +119,7 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        model = load_model(cfg.policy, cache_dir=str(ROOT))
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
@@ -100,9 +134,9 @@ def run(cfg: DictConfig):
         policy = swm.policy.RandomPolicy()
 
     results_path = (
-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
-        else Path(__file__).parent
+        (ROOT / "checkpoints" / cfg.policy).parent
+        if policy != "random"
+        else ROOT
     )
 
     # sample the episodes and the starting indices
