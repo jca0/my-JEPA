@@ -7,6 +7,23 @@ def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
     return x * (1 + scale) + shift
 
+class MobileNetEncoder(nn.Module):
+    def __init__(self, embed_dim=192, pretrained=True):
+        super().__init__()
+        from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        backbone = mobilenet_v3_small(weights=weights)
+        self.features = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(576, embed_dim)
+
+    def forward(self, pixel_values, **kwargs):
+        x = self.features(pixel_values)
+        x = self.pool(x).flatten(1)
+        x = self.proj(x)
+        return type('Out', (), {'last_hidden_state': x.unsqueeze(1)})()
+
+
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
 
