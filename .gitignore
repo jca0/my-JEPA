@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
-.venv/
-runs/
+.stable_worldmodel/
+outputs/
 wandb/
-*.pt
-*.mp4
+lewm-pusht/
+kickbacks.vsix
