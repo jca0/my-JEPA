@@ -1,0 +1,16 @@
+[project]
+name = "my-jepa"
+version = "0.1.0"
+requires-python = "==3.10.*"
+dependencies = [
+    "stable-worldmodel[train,env]",
+    "torch==2.4.1+cu124",
+    "torchvision==0.19.1+cu124",
+    "pyarrow==23.0.1",
+    "datasets==5.0.0",
+    "hdf5plugin==6.0.0",
+]
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-url = "https://pypi.org/simple"
