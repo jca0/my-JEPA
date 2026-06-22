@@ -8,7 +8,7 @@ wandb:
   enabled: True
   config:
     entity: jing-cao
-    project: lewm
+    project: my-jepa
     name: ${output_model_name}
     id: ${subdir}
     resume: allow
