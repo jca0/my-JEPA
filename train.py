@@ -57,7 +57,7 @@ def run(cfg):
     root = Path(__file__).resolve().parent
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
-    cache_dir = root
+    cache_dir = Path(os.environ.get("DATA_DIR", root))
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
