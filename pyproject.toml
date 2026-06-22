@@ -11,6 +11,8 @@ dependencies = [
     "hdf5plugin==6.0.0",
 ]
 
+[tool.setuptools]
+py-modules = ["jepa", "module", "train", "eval", "utils"]
+
 [tool.uv]
-index-url = "https://download.pytorch.org/whl/cu124"
-extra-index-url = "https://pypi.org/simple"
+extra-index-url = ["https://download.pytorch.org/whl/cu124"]
