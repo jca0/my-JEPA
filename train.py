@@ -12,6 +12,7 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg
@@ -126,20 +127,40 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
+    # Lightning checkpoint callback for resuming training
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=run_dir,
+        filename=f"{cfg.output_model_name}_weights",
+        save_top_k=1,  # Only keep the latest checkpoint
+        save_last=True,  # Save the last epoch
+        every_n_epochs=1,
+    )
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=[object_dump_callback, checkpoint_callback],
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
     )
+
+    # Check for .pt weights to resume from (legacy format)
+    legacy_weights = sorted(run_dir.glob("weights_epoch_*.pt"))
+    if legacy_weights:
+        latest_weights = legacy_weights[-1]
+        epoch_num = int(latest_weights.stem.split('_')[-1])
+        print(f"Found legacy weights: {latest_weights.name}")
+        print(f"Loading model weights from epoch {epoch_num}...")
+        weights = torch.load(latest_weights, map_location='cpu')
+        world_model.model.load_state_dict(weights)
+        print(f"✓ Loaded weights from epoch {epoch_num}, will continue training from epoch {epoch_num + 1}")
 
     ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=ckpt_path if ckpt_path.exists() else None,
+        ckpt_path=ckpt_path if ckpt_path.exists() and not legacy_weights else None,
     )
 
     manager()
