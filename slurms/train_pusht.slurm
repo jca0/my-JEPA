@@ -23,12 +23,6 @@ source /home/jingcao/workspace/my-JEPA/.venv/bin/activate
 # Set data directory to scratch
 export DATA_DIR=/scratch/jingcao/my-JEPA
 
-# Disable SSL verification for PyTorch model downloads (workaround for compute node cert issues)
-export TORCH_HOME=/scratch/jingcao/my-JEPA/.cache/torch
-export REQUESTS_CA_BUNDLE=""
-export CURL_CA_BUNDLE=""
-mkdir -p $TORCH_HOME
-
 # Create datasets directory on this node's scratch
 mkdir -p /scratch/jingcao/my-JEPA/datasets
 
@@ -52,7 +46,6 @@ fi
 cd /home/jingcao/workspace/my-JEPA
 
 # Run training
-# Set subdir to match your run directory for resuming
-python train.py data=pusht model=mobilenet subdir=lewm
+python train.py data=pusht model=mobilenet subdir=pusht_mobilenet_001
 
 echo "Job finished at: $(date)"
