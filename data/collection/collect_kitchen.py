@@ -9,8 +9,8 @@ CONTROLS
 
 USAGE
 -----
-    python data/collection/collect_kitchen.py --tasks microwave --episodes 20
-    python data/collection/collect_kitchen.py --tasks microwave kettle --episodes 30
+    python data/collection/collect_kitchen.py --tasks microwave
+    python data/collection/collect_kitchen.py --tasks microwave kettle
 
 OUTPUT
 ------
@@ -18,7 +18,7 @@ OUTPUT
 
     HDF5 layout:
         /episode_N/obs     float32 (T, 59)  — observation at each step
-        /episode_N/action  float32 (T, 9)   — joint velocity command sent
+        /episode_N/action  float32 (T, 9)   — joint position command (normalized)
         /episode_N/reward  float32 (T,)     — task reward
         /episode_N/done    bool    (T,)     — episode termination flag
 
@@ -44,12 +44,14 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = ROOT / "data" / "raw"
 
 # Phone-to-sim scaling
-POS_SCALE = 5.0  
+POS_SCALE = 3.0
 ROT_SCALE = 1.0
 
-# Proportional gains: position/rotation error → velocity command
-POS_GAIN = 2.0
-ROT_GAIN = 1.0
+# IK parameters
+IK_ITERS = 50
+IK_STEP = 0.5
+IK_DAMPING = 0.01
+IK_TOL = 1e-3
 
 
 # Environment
@@ -62,80 +64,68 @@ def make_env(tasks: list, render: bool = True):
         tasks_to_complete=tasks,
         render_mode="human" if render else None,
         terminate_on_tasks_completed=False,
-        max_episode_steps=100000,  # Effectively unlimited
+        max_episode_steps=100000,
     )
     return env
 
 
-# IK: phone 6-DOF pose → joint velocities (for position-based control)
-def get_ee_jacobian(model, data, ee_site_id: int) -> np.ndarray:
-    jacp = np.zeros((3, model.nv))
-    jacr = np.zeros((3, model.nv))
-    mujoco.mj_jacSite(model, data, jacp, jacr, ee_site_id)
-    return np.vstack([jacp, jacr])  # (6, nv)
-
-
-def phone_pose_to_joint_vel(
+# IK: target EE pose → joint positions (radians)
+def solve_ik(
     target_pos: np.ndarray,
     target_quat: np.ndarray,
-    gripper_vel: float,
     model,
     data,
     ee_site_id: int,
 ) -> np.ndarray:
     """
-    Convert target EE pose to joint velocities using Jacobian.
-    This creates position-based behavior through proportional control.
+    Solve IK for a target EE pose. Returns 7 joint positions in radians.
 
-    Args:
-        target_pos: desired end-effector position (3,)
-        target_quat: desired end-effector quaternion (4,) scipy format [x,y,z,w]
-        gripper_vel: gripper velocity [-1, 1]
-        model: MuJoCo model
-        data: MuJoCo data
-        ee_site_id: end-effector site ID
-
-    Returns:
-        joint velocities [-1, 1]^9
+    Uses iterative Jacobian IK on a temporary data object so we don't
+    corrupt the simulation state.
     """
-    # Get current EE pose
-    current_pos = data.site_xpos[ee_site_id].copy()
-    current_mat = data.site_xmat[ee_site_id].reshape(3, 3)
-    current_rot = Rotation.from_matrix(current_mat)
+    d = mujoco.MjData(model)
+    d.qpos[:] = data.qpos[:]
 
-    # Position error
-    pos_error = target_pos - current_pos
+    qpos_arm = d.qpos[:7].copy()
+    target_rot = Rotation.from_quat(target_quat)  # scipy [x,y,z,w]
 
-    # Orientation error (axis-angle)
-    target_rot = Rotation.from_quat(target_quat)  # scipy format [x,y,z,w]
-    rot_error = (target_rot * current_rot.inv()).as_rotvec()
+    for _ in range(IK_ITERS):
+        d.qpos[:7] = qpos_arm
+        mujoco.mj_fwdPosition(model, d)
 
-    # Desired task-space velocity (proportional control)
-    task_vel = np.concatenate([pos_error * POS_GAIN, rot_error * ROT_GAIN])
+        cur_pos = d.site_xpos[ee_site_id]
+        cur_rot = Rotation.from_matrix(d.site_xmat[ee_site_id].reshape(3, 3))
 
-    # Jacobian for arm joints only
-    J_arm = get_ee_jacobian(model, data, ee_site_id)[:, :7]  # (6, 7)
+        pos_err = target_pos - cur_pos
+        rot_err = (target_rot * cur_rot.inv()).as_rotvec()
+        err = np.concatenate([pos_err, rot_err])
 
-    # Damped least-squares to get joint velocities
-    damping = 0.05
-    JJT = J_arm @ J_arm.T
-    joint_vel = J_arm.T @ np.linalg.solve(JJT + damping**2 * np.eye(6), task_vel)
+        if np.linalg.norm(err) < IK_TOL:
+            break
 
-    gripper_cmd = np.full(2, gripper_vel)
+        jacp = np.zeros((3, model.nv))
+        jacr = np.zeros((3, model.nv))
+        mujoco.mj_jacSite(model, d, jacp, jacr, ee_site_id)
+        J = np.vstack([jacp[:, :7], jacr[:, :7]])
 
-    return np.clip(np.concatenate([joint_vel, gripper_cmd]), -1.0, 1.0)
+        JJT = J @ J.T + IK_DAMPING * np.eye(6)
+        dq = J.T @ np.linalg.solve(JJT, err)
+        qpos_arm += IK_STEP * dq
+
+        # Clip to actual joint limits
+        for i in range(7):
+            qpos_arm[i] = np.clip(qpos_arm[i], model.jnt_range[i, 0], model.jnt_range[i, 1])
+
+    return qpos_arm
 
 
 # iPhone teleop stream (HEBI SDK + ARKit)
 class IOSTeleopStream:
     """
     Reads 6-DOF ARKit pose from an iPhone running the HEBI Mobile I/O app.
-
-    Mirrors LeRobot's IOSPhone class but standalone (no lerobot dependency).
     B1 = hold to record episode (release ends it). B3 = toggle gripper.
     """
 
-    # iPhone 14 Pro camera is offset from physical center
     CAMERA_OFFSET = np.array([0.0, -0.02, 0.04])
 
     def __init__(self):
@@ -145,8 +135,8 @@ class IOSTeleopStream:
         self._calib_pos: np.ndarray | None = None
         self._calib_rot_inv: Rotation | None = None
         self._enabled = False
-        self._gripper_open = True  # Start with gripper open
-        self._prev_b3 = False      # For edge detection
+        self._gripper_open = True
+        self._prev_b3 = False
 
     def connect(self):
         print("Searching for HEBI Mobile I/O... (make sure the app is open and on the same WiFi)")
@@ -180,7 +170,7 @@ class IOSTeleopStream:
         if fbk is None:
             return False, None, None, None
         pose = fbk[0]
-        ar_pos  = getattr(pose, "ar_position",    None)
+        ar_pos = getattr(pose, "ar_position", None)
         ar_quat = getattr(pose, "ar_orientation", None)
         if ar_pos is None or ar_quat is None:
             return False, None, None, fbk
@@ -196,8 +186,7 @@ class IOSTeleopStream:
             if not ok:
                 time.sleep(0.01)
                 continue
-            b1 = self._get_b1(fbk)
-            if b1:
+            if self._get_b1(fbk):
                 return pos, rot
             time.sleep(0.01)
 
@@ -218,10 +207,7 @@ class IOSTeleopStream:
         return self._calib_pos is not None
 
     def get_action(self):
-        """
-        Returns dict with keys: pos, rotvec, gripper_vel, enabled.
-        Returns None if no valid pose available yet.
-        """
+        """Returns dict with keys: pos, rotvec, gripper_open, enabled."""
         ok, raw_pos, raw_rot, fbk = self._read_pose()
         if not ok or not self.is_calibrated:
             return None
@@ -245,15 +231,12 @@ class IOSTeleopStream:
             pos_cal = np.zeros(3)
             rot_cal = Rotation.identity()
 
-        # Gripper velocity: -1 to close, +1 to open
-        gripper_vel = 1.0 if self._gripper_open else -1.0
-
         self._enabled = b1
         return {
-            "pos":         pos_cal,
-            "rotvec":      rot_cal.as_rotvec(),
-            "gripper_vel": gripper_vel,
-            "enabled":     b1,
+            "pos":          pos_cal,
+            "rotvec":       rot_cal.as_rotvec(),
+            "gripper_open": self._gripper_open,
+            "enabled":      b1,
         }
 
 
@@ -262,16 +245,25 @@ def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
     """
     Collect one episode. Returns None if the user discards it (Ctrl+C).
     Hold B1 to record and control. Release B1 to end. B3 toggles gripper.
+
+    Bypasses env.step() for control (writes directly to data.ctrl) because
+    the env's action normalization clips joint 3's range.
     """
     obs_list, action_list, reward_list, done_list = [], [], [], []
 
     obs, _ = env.reset()
-    raw_obs = obs["observation"].astype(np.float32)
 
-    robot_env  = env.unwrapped.robot_env
-    model      = robot_env.model
-    data       = robot_env.data
+    robot_env = env.unwrapped.robot_env
+    model = robot_env.model
+    data = robot_env.data
     ee_site_id = model.site("end_effector").id
+    frame_skip = robot_env.frame_skip
+
+    def get_obs():
+        robot_obs = robot_env._get_obs()
+        return env.unwrapped._get_obs(robot_obs)["observation"].astype(np.float32)
+
+    raw_obs = get_obs()
 
     print("  [Episode] Hold B1 to start recording and control. Release B1 to end. B3 toggles gripper.")
 
@@ -288,45 +280,53 @@ def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
                 continue
 
             if phone["enabled"]:
-                # First press: capture EE reference and start recording
                 if not started:
                     started = True
                     ref_ee_pos = data.site_xpos[ee_site_id].copy()
-                    ref_ee_mat = data.site_xmat[ee_site_id].reshape(3, 3).copy()
-                    ref_ee_quat = Rotation.from_matrix(ref_ee_mat).as_quat()
+                    ref_ee_quat = Rotation.from_matrix(
+                        data.site_xmat[ee_site_id].reshape(3, 3)
+                    ).as_quat()
                     print("  [Episode] Recording...")
 
-                # Compute target EE pose from phone delta
+                # Target EE pose = reference + scaled phone delta
                 target_pos = ref_ee_pos + phone["pos"] * POS_SCALE
                 phone_rot = Rotation.from_rotvec(phone["rotvec"] * ROT_SCALE)
-                ref_rot = Rotation.from_quat(ref_ee_quat)
-                target_quat = (ref_rot * phone_rot).as_quat()
+                target_quat = (Rotation.from_quat(ref_ee_quat) * phone_rot).as_quat()
 
-                action = phone_pose_to_joint_vel(
-                    target_pos,
-                    target_quat,
-                    phone["gripper_vel"],
-                    model, data, ee_site_id,
-                ).astype(np.float32)
+                # Solve IK → joint positions (radians)
+                qpos_target = solve_ik(target_pos, target_quat, model, data, ee_site_id)
+
+                # Gripper target
+                gripper_target = 0.04 if phone["gripper_open"] else 0.0
+
+                # Write directly to ctrl (bypasses env's broken normalization)
+                data.ctrl[:7] = qpos_target
+                data.ctrl[7] = gripper_target
+                data.ctrl[8] = gripper_target
             else:
-                # B1 released after recording started → end episode
                 if started:
                     break
                 time.sleep(0.01)
                 continue
 
-            next_obs, reward, terminated, truncated, _ = env.step(action)
+            # Step the simulation
+            for _ in range(frame_skip):
+                mujoco.mj_step(model, data)
+
+            if robot_env.render_mode == "human":
+                robot_env.render()
+
+            # Record
+            action = np.concatenate([qpos_target, [gripper_target, gripper_target]])
+            new_obs = get_obs()
 
             obs_list.append(raw_obs)
-            action_list.append(action)
-            reward_list.append(float(reward))
-            done_list.append(bool(terminated or truncated))
+            action_list.append(action.astype(np.float32))
+            reward_list.append(0.0)
+            done_list.append(False)
 
-            raw_obs = next_obs["observation"].astype(np.float32)
+            raw_obs = new_obs
             step += 1
-
-            if terminated or truncated:
-                break
 
             time.sleep(0.02)  # ~50 Hz
 
@@ -334,12 +334,12 @@ def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
         print("  [Episode] Discarded.")
         return None
 
-    print(f"  [Episode] Complete — {step} steps, total reward={sum(reward_list):.2f}")
+    print(f"  [Episode] Complete — {step} steps")
     return {
-        "obs":    np.array(obs_list,    dtype=np.float32),
+        "obs":    np.array(obs_list, dtype=np.float32),
         "action": np.array(action_list, dtype=np.float32),
         "reward": np.array(reward_list, dtype=np.float32),
-        "done":   np.array(done_list,   dtype=bool),
+        "done":   np.array(done_list, dtype=bool),
     }
 
 
@@ -385,7 +385,7 @@ def main():
     print(f"  Recording episodes until Ctrl+C")
     print("=" * 60)
 
-    env    = make_env(args.tasks, render=True)
+    env = make_env(args.tasks, render=True)
     teleop = IOSTeleopStream()
     teleop.connect()
     teleop.calibrate()
@@ -399,7 +399,7 @@ def main():
                 save_episode(ep, args.tasks, out_path, ep_idx)
                 ep_idx += 1
     except KeyboardInterrupt:
-        print("\n\nCollection stopped by user.")
+        print("\n\nCollection stopped.")
 
     env.close()
     print(f"\nTotal episodes collected: {ep_idx}")
