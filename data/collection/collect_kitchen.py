@@ -45,7 +45,10 @@ DATA_DIR = ROOT / "data" / "raw"
 
 # Phone-to-sim scaling
 POS_SCALE = 3.0
-ROT_SCALE = 1.0
+ROT_SCALE = 3.0
+
+# Low-pass filter smoothing (0 = no smoothing, 1 = frozen)
+SMOOTH_ALPHA = 0.7
 
 # IK parameters
 IK_ITERS = 50
@@ -76,15 +79,20 @@ def solve_ik(
     model,
     data,
     ee_site_id: int,
+    seed_qpos: np.ndarray = None,
 ) -> np.ndarray:
     """
     Solve IK for a target EE pose. Returns 7 joint positions in radians.
 
     Uses iterative Jacobian IK on a temporary data object so we don't
-    corrupt the simulation state.
+    corrupt the simulation state. If seed_qpos is provided, starts from
+    that configuration for consistency between frames.
     """
     d = mujoco.MjData(model)
     d.qpos[:] = data.qpos[:]
+
+    if seed_qpos is not None:
+        d.qpos[:7] = seed_qpos
 
     qpos_arm = d.qpos[:7].copy()
     target_rot = Rotation.from_quat(target_quat)  # scipy [x,y,z,w]
@@ -271,6 +279,9 @@ def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
     started = False
     ref_ee_pos = None
     ref_ee_quat = None
+    prev_qpos_target = None
+    smooth_pos = np.zeros(3)
+    smooth_rotvec = np.zeros(3)
 
     try:
         while True:
@@ -286,15 +297,24 @@ def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
                     ref_ee_quat = Rotation.from_matrix(
                         data.site_xmat[ee_site_id].reshape(3, 3)
                     ).as_quat()
+                    smooth_pos = phone["pos"].copy()
+                    smooth_rotvec = phone["rotvec"].copy()
                     print("  [Episode] Recording...")
 
-                # Target EE pose = reference + scaled phone delta
-                target_pos = ref_ee_pos + phone["pos"] * POS_SCALE
-                phone_rot = Rotation.from_rotvec(phone["rotvec"] * ROT_SCALE)
+                # Low-pass filter
+                smooth_pos = SMOOTH_ALPHA * smooth_pos + (1 - SMOOTH_ALPHA) * phone["pos"]
+                smooth_rotvec = SMOOTH_ALPHA * smooth_rotvec + (1 - SMOOTH_ALPHA) * phone["rotvec"]
+
+                # Direct mapping: phone XYZ → world XYZ
+                target_pos = ref_ee_pos + smooth_pos * POS_SCALE
+                phone_rot = Rotation.from_rotvec(smooth_rotvec * ROT_SCALE)
                 target_quat = (Rotation.from_quat(ref_ee_quat) * phone_rot).as_quat()
 
                 # Solve IK → joint positions (radians)
-                qpos_target = solve_ik(target_pos, target_quat, model, data, ee_site_id)
+                qpos_target = solve_ik(target_pos, target_quat, model, data, ee_site_id, prev_qpos_target)
+                prev_qpos_target = qpos_target.copy()
+
+
 
                 # Gripper target
                 gripper_target = 0.04 if phone["gripper_open"] else 0.0
