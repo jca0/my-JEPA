@@ -1,33 +1,13 @@
 """
 Franka Kitchen teleop data collection via iPhone (HEBI Mobile I/O + ARKit).
 
-OVERVIEW
---------
-Run this script on your LOCAL MACHINE — not EC2. The iPhone and your laptop
-must be on the same WiFi. The iPhone streams 6-DOF ARKit pose over UDP via the
-HEBI Mobile I/O app; this script converts pose deltas to Franka joint velocities
-using Jacobian IK, steps the MuJoCo sim, and saves episodes to HDF5.
-
-After collecting, copy data to EC2 for training:
-    scp data/raw/kitchen_teleop_*.h5 ubuntu@<EC2_IP>:~/workspace/my-JEPA/data/raw/
-
-SETUP
------
-1. Clone this repo locally and create a Python 3.10 venv:
-       python3.10 -m venv .venv && source .venv/bin/activate
-       pip install hebi-py gymnasium gymnasium-robotics mujoco h5py scipy
-
-2. Install the free HEBI Mobile I/O app on your iPhone (App Store).
-   In the app settings: Family = "HEBI", Name = "mobileIO".
-
-3. Connect your iPhone and laptop to the same WiFi network.
-
 CONTROLS
 --------
+    B2 (press once)    : start/end episode recording
     B1 (press & hold)  : enable teleoperation. On the first press, the current
                          phone pose is captured as the reference (zero position).
-                         Releasing B1 pauses the robot mid-episode.
-    A3 (analog slider) : gripper — slide up to close, down to open, center to hold.
+                         Releasing B1 pauses the robot (but continues recording).
+    B3 (press to toggle) : toggle gripper open/closed
     Ctrl+C             : discard the current episode and retry.
 
 USAGE
@@ -53,7 +33,6 @@ OUTPUT
 """
 
 import argparse
-import logging
 import time
 from datetime import datetime
 from pathlib import Path
@@ -63,14 +42,13 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = ROOT / "data" / "raw"
 
-# Scale phone position deltas (meters) → joint velocity magnitude
-POS_GAIN     = 3.0
-ROT_GAIN     = 1.5
+# Control gains for velocity control
+POS_GAIN = 2.0   # Position error → velocity
+ROT_GAIN = 1.0   # Rotation error → angular velocity
 GRIPPER_GAIN = 1.0
 
 
@@ -78,7 +56,7 @@ GRIPPER_GAIN = 1.0
 # Environment
 # ---------------------------------------------------------------------------
 
-def make_env(tasks: list, render: bool = False):
+def make_env(tasks: list, render: bool = True):
     import gymnasium
     import gymnasium_robotics  # noqa: F401 — registers envs
 
@@ -87,12 +65,13 @@ def make_env(tasks: list, render: bool = False):
         tasks_to_complete=tasks,
         render_mode="human" if render else None,
         terminate_on_tasks_completed=False,
+        max_episode_steps=100000,  # Effectively unlimited
     )
     return env
 
 
 # ---------------------------------------------------------------------------
-# IK: phone 6-DOF delta → 9D joint velocity
+# IK: phone 6-DOF pose → joint velocities (for position-based control)
 # ---------------------------------------------------------------------------
 
 def get_ee_jacobian(model, data, ee_site_id: int) -> np.ndarray:
@@ -103,21 +82,55 @@ def get_ee_jacobian(model, data, ee_site_id: int) -> np.ndarray:
 
 
 def phone_pose_to_joint_vel(
-    pos_delta: np.ndarray,
-    rotvec_delta: np.ndarray,
+    target_pos: np.ndarray,
+    target_quat: np.ndarray,
     gripper_vel: float,
     model,
     data,
     ee_site_id: int,
 ) -> np.ndarray:
-    """Damped least-squares Jacobian IK. Returns clipped action in [-1, 1]^9."""
+    """
+    Convert target EE pose to joint velocities using Jacobian.
+    This creates position-based behavior through proportional control.
+
+    Args:
+        target_pos: desired end-effector position (3,)
+        target_quat: desired end-effector quaternion (4,) scipy format [x,y,z,w]
+        gripper_vel: gripper velocity [-1, 1]
+        model: MuJoCo model
+        data: MuJoCo data
+        ee_site_id: end-effector site ID
+
+    Returns:
+        joint velocities [-1, 1]^9
+    """
+    # Get current EE pose
+    current_pos = data.site_xpos[ee_site_id].copy()
+    current_mat = data.site_xmat[ee_site_id].reshape(3, 3)
+    current_rot = Rotation.from_matrix(current_mat)
+
+    # Position error
+    pos_error = target_pos - current_pos
+
+    # Orientation error (axis-angle)
+    target_rot = Rotation.from_quat(target_quat)  # scipy format [x,y,z,w]
+    rot_error = (target_rot * current_rot.inv()).as_rotvec()
+
+    # Desired task-space velocity (proportional control)
+    task_vel = np.concatenate([pos_error * POS_GAIN, rot_error * ROT_GAIN])
+
+    # Jacobian for arm joints only
     J_arm = get_ee_jacobian(model, data, ee_site_id)[:, :7]  # (6, 7)
-    task_vel = np.concatenate([pos_delta * POS_GAIN, rotvec_delta * ROT_GAIN])
+
+    # Damped least-squares to get joint velocities
     damping = 0.05
     JJT = J_arm @ J_arm.T
-    dls = J_arm.T @ np.linalg.solve(JJT + damping ** 2 * np.eye(6), task_vel)
+    joint_vel = J_arm.T @ np.linalg.solve(JJT + damping**2 * np.eye(6), task_vel)
+
+    # Gripper velocity
     gripper_cmd = np.full(2, gripper_vel * GRIPPER_GAIN)
-    return np.clip(np.concatenate([dls, gripper_cmd]), -1.0, 1.0)
+
+    return np.clip(np.concatenate([joint_vel, gripper_cmd]), -1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +142,7 @@ class IOSTeleopStream:
     Reads 6-DOF ARKit pose from an iPhone running the HEBI Mobile I/O app.
 
     Mirrors LeRobot's IOSPhone class but standalone (no lerobot dependency).
-    B1 = enable/disable. A3 = gripper analog.
+    B1 = enable/disable teleop. B2 = start/end episode. B3 = toggle gripper.
     """
 
     # iPhone 14 Pro camera is offset from physical center
@@ -142,6 +155,8 @@ class IOSTeleopStream:
         self._calib_pos: np.ndarray | None = None
         self._calib_rot_inv: Rotation | None = None
         self._enabled = False
+        self._gripper_open = True  # Start with gripper open
+        self._prev_b3 = False      # For edge detection
 
     def connect(self):
         print("Searching for HEBI Mobile I/O... (make sure the app is open and on the same WiFi)")
@@ -202,11 +217,17 @@ class IOSTeleopStream:
         except Exception:
             return False
 
-    def _get_a3(self, fbk) -> float:
+    def _get_b2(self, fbk) -> bool:
         try:
-            return float(fbk[0].io.a.get_float(3))
+            return bool(fbk[0].io.b.get_int(2))
         except Exception:
-            return 0.0
+            return False
+
+    def _get_b3(self, fbk) -> bool:
+        try:
+            return bool(fbk[0].io.b.get_int(3))
+        except Exception:
+            return False
 
     @property
     def is_calibrated(self) -> bool:
@@ -214,7 +235,7 @@ class IOSTeleopStream:
 
     def get_action(self):
         """
-        Returns dict with keys: pos, rotvec, gripper_vel, enabled.
+        Returns dict with keys: pos, rotvec, gripper_vel, enabled, b2_pressed.
         Returns None if no valid pose available yet.
         """
         ok, raw_pos, raw_rot, fbk = self._read_pose()
@@ -222,7 +243,13 @@ class IOSTeleopStream:
             return None
 
         b1 = self._get_b1(fbk)
-        gripper_vel = self._get_a3(fbk)
+        b2 = self._get_b2(fbk)
+        b3 = self._get_b3(fbk)
+
+        # B3 toggle gripper on rising edge
+        if b3 and not self._prev_b3:
+            self._gripper_open = not self._gripper_open
+        self._prev_b3 = b3
 
         # Rising edge: re-anchor position reference
         if b1 and not self._enabled:
@@ -235,12 +262,16 @@ class IOSTeleopStream:
             pos_cal = np.zeros(3)
             rot_cal = Rotation.identity()
 
+        # Gripper velocity: -1 to close, +1 to open
+        gripper_vel = 1.0 if self._gripper_open else -1.0
+
         self._enabled = b1
         return {
             "pos":         pos_cal,
             "rotvec":      rot_cal.as_rotvec(),
             "gripper_vel": gripper_vel,
             "enabled":     b1,
+            "b2_pressed":  b2,
         }
 
 
@@ -248,10 +279,10 @@ class IOSTeleopStream:
 # Episode collection
 # ---------------------------------------------------------------------------
 
-def collect_episode(env, teleop: IOSTeleopStream, max_steps: int = 500) -> dict | None:
+def collect_episode(env, teleop: IOSTeleopStream) -> dict | None:
     """
     Collect one episode. Returns None if the user discards it (Ctrl+C).
-    Hold B1 to drive the robot; release to pause. A3 controls gripper.
+    B2 starts/ends recording. B1 enables/pauses teleop. B3 toggles gripper.
     """
     obs_list, action_list, reward_list, done_list = [], [], [], []
 
@@ -263,21 +294,67 @@ def collect_episode(env, teleop: IOSTeleopStream, max_steps: int = 500) -> dict 
     data       = robot_env.data
     ee_site_id = model.site("end_effector").id
 
-    print("  [Episode] Hold B1 and move phone to control. Release B1 to pause. Ctrl+C to discard.")
-    step = 0
-    try:
-        while step < max_steps:
-            phone = teleop.get_action()
+    print("  [Episode] Press B2 to start recording. Press B2 again to end. Ctrl+C to discard.")
+    print("  [Episode] Hold B1 to control robot (pauses when released). B3 toggles gripper.")
 
-            if phone is None or not phone["enabled"]:
-                action = np.zeros(9, dtype=np.float32)
-            else:
+    step = 0
+    recording = False
+    prev_b2 = False
+    ref_ee_pos = None
+    ref_ee_quat = None
+
+    try:
+        while True:
+            phone = teleop.get_action()
+            if phone is None:
+                time.sleep(0.01)
+                continue
+
+            # B2 toggle recording on rising edge
+            b2_pressed = phone["b2_pressed"]
+            if b2_pressed and not prev_b2:
+                recording = not recording
+                if recording:
+                    print("  [Episode] Recording started...")
+                    # Capture initial EE pose as reference
+                    ref_ee_pos = data.site_xpos[ee_site_id].copy()
+                    # Get rotation matrix and convert to quaternion
+                    ref_ee_mat = data.site_xmat[ee_site_id].reshape(3, 3).copy()
+                    ref_rot = Rotation.from_matrix(ref_ee_mat)
+                    ref_ee_quat = ref_rot.as_quat()  # scipy format [x,y,z,w]
+                else:
+                    print("  [Episode] Recording ended.")
+                    break
+            prev_b2 = b2_pressed
+
+            # Only record if B2 has been pressed to start
+            if not recording:
+                time.sleep(0.01)
+                continue
+
+            if phone["enabled"]:
+                # Compute target EE pose from phone delta
+                phone_pos_delta = phone["pos"]
+                phone_rot = Rotation.from_rotvec(phone["rotvec"])
+
+                # Target EE position = reference + phone displacement
+                target_pos = ref_ee_pos + phone_pos_delta
+
+                # Target EE orientation = reference * phone rotation
+                ref_rot = Rotation.from_quat(ref_ee_quat)  # scipy [x,y,z,w]
+                target_rot = ref_rot * phone_rot
+                target_quat = target_rot.as_quat()  # scipy [x,y,z,w]
+
+                # Compute joint velocities to move EE toward target
                 action = phone_pose_to_joint_vel(
-                    phone["pos"],
-                    phone["rotvec"],
+                    target_pos,
+                    target_quat,
                     phone["gripper_vel"],
                     model, data, ee_site_id,
                 ).astype(np.float32)
+            else:
+                # Send zero velocity to stop
+                action = np.zeros(9, dtype=np.float32)
 
             next_obs, reward, terminated, truncated, _ = env.step(action)
 
@@ -311,16 +388,21 @@ def collect_episode(env, teleop: IOSTeleopStream, max_steps: int = 500) -> dict 
 # HDF5 saving
 # ---------------------------------------------------------------------------
 
-def save_episodes(episodes: list, tasks: list, out_path: Path) -> None:
+def save_episode(episode: dict, tasks: list, out_path: Path, episode_idx: int) -> None:
+    """Append a single episode to the HDF5 file."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(out_path, "w") as f:
-        f.attrs["tasks"]      = tasks
-        f.attrs["n_episodes"] = len(episodes)
-        for i, ep in enumerate(episodes):
-            grp = f.create_group(f"episode_{i}")
-            for key, arr in ep.items():
-                grp.create_dataset(key, data=arr, compression="gzip")
-    print(f"\nSaved {len(episodes)} episodes → {out_path}")
+
+    mode = "a" if out_path.exists() else "w"
+    with h5py.File(out_path, mode) as f:
+        if "tasks" not in f.attrs:
+            f.attrs["tasks"] = tasks
+        f.attrs["n_episodes"] = episode_idx + 1
+
+        grp = f.create_group(f"episode_{episode_idx}")
+        for key, arr in episode.items():
+            grp.create_dataset(key, data=arr, compression="gzip")
+
+    print(f"  [Episode] Saved → {out_path} (episode {episode_idx})")
 
 
 # ---------------------------------------------------------------------------
@@ -334,10 +416,7 @@ def main():
         choices=["microwave", "kettle", "bottom_burner", "top_burner",
                  "light_switch", "slide_cabinet", "hinge_cabinet"],
     )
-    parser.add_argument("--episodes",  type=int, default=20)
-    parser.add_argument("--max_steps", type=int, default=500)
-    parser.add_argument("--render",    action="store_true", help="Show MuJoCo GUI")
-    parser.add_argument("--out",       type=str, default=None)
+    parser.add_argument("--out", type=str, default=None)
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -346,39 +425,37 @@ def main():
         else DATA_DIR / f"kitchen_teleop_{'_'.join(args.tasks)}_{timestamp}.h5"
     )
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
     print("=" * 60)
     print("Franka Kitchen iPhone Teleop Collection")
-    print(f"  tasks:    {args.tasks}")
-    print(f"  episodes: {args.episodes}")
-    print(f"  output:   {out_path}")
+    print(f"  tasks:  {args.tasks}")
+    print(f"  output: {out_path}")
+    print(f"  Recording episodes until Ctrl+C")
     print("=" * 60)
 
-    env    = make_env(args.tasks, render=args.render)
+    env    = make_env(args.tasks, render=True)
     teleop = IOSTeleopStream()
     teleop.connect()
     teleop.calibrate()
 
-    episodes = []
-    ep_idx   = 0
-    while ep_idx < args.episodes:
-        print(f"\n--- Episode {ep_idx + 1}/{args.episodes} ---")
-        ep = collect_episode(env, teleop, max_steps=args.max_steps)
-        if ep is not None:
-            episodes.append(ep)
-            ep_idx += 1
-        else:
-            ans = input("  Retry? [Y/n]: ").strip().lower()
-            if ans == "n":
+    ep_idx = 0
+    try:
+        while True:
+            print(f"\n--- Episode {ep_idx + 1} ---")
+            ep = collect_episode(env, teleop)
+            if ep is not None:
+                save_episode(ep, args.tasks, out_path, ep_idx)
                 ep_idx += 1
+            else:
+                ans = input("  Retry? [Y/n]: ").strip().lower()
+                if ans != "n":
+                    continue
+                else:
+                    ep_idx += 1
+    except KeyboardInterrupt:
+        print("\n\nCollection stopped by user.")
 
     env.close()
-
-    if episodes:
-        save_episodes(episodes, args.tasks, out_path)
-    else:
-        print("No episodes collected.")
+    print(f"\nTotal episodes collected: {ep_idx}")
 
 
 if __name__ == "__main__":
