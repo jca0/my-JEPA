@@ -390,7 +390,6 @@ def main():
                  "light_switch", "slide_cabinet", "hinge_cabinet"],
     )
     parser.add_argument("--out", type=str, default=None)
-    parser.add_argument("--render", action="store_true", help="Open MuJoCo viewer window.")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -406,7 +405,7 @@ def main():
     print(f"  Recording episodes until Ctrl+C")
     print("=" * 60)
 
-    env = make_env(args.tasks, render=args.render)
+    env = make_env(args.tasks, render=True)
     teleop = IOSTeleopStream()
     teleop.connect()
     teleop.calibrate()
